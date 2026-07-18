@@ -9,6 +9,7 @@ Streamlit version of the two-way conversation aid:
 
 Both directions write into one shared transcript.
 
+
 DESIGN NOTES (why this differs slightly from the Gradio version):
 
   - Streamlit's built-in camera widget (st.camera_input) only captures a
@@ -27,9 +28,12 @@ DESIGN NOTES (why this differs slightly from the Gradio version):
     Community Cloud enforces a hard 1 GiB RAM limit per app -- "tiny"
     has a much smaller memory footprint, trading a little transcription
     accuracy for headroom against that ceiling.
-    RTC_CONFIGURATION = RTCConfiguration(
-    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-)
+
+  - WebRTC ICE servers come from turn.py's get_ice_servers(), which uses
+    Twilio's TURN service. This is required, not optional -- Streamlit
+    Community Cloud's infrastructure does not reliably allow WebRTC
+    connections using STUN alone (confirmed directly in streamlit-webrtc's
+    own official sample code/docs).
 """
 
 import json
@@ -47,6 +51,7 @@ import torch
 from slr.landmarks import HolisticLandmarkExtractor, iter_video_landmarks, FEATURE_DIM
 from slr.model import SignLanguageArcFaceTCN
 from stt.speech_to_text import SpeechToText
+from turn import get_ice_servers
 
 try:
     from streamlit_webrtc import webrtc_streamer, RTCConfiguration
@@ -74,32 +79,6 @@ WINDOW_SECONDS = 2.0        # how many seconds of recent frames to keep in the b
 INFER_EVERY_N_FRAMES = 5    # run inference every N incoming frames (lower = more responsive, more CPU)
 MOTION_THRESHOLD = 0.003    # skip inference when the window is nearly static (idle hands)
 ASSUMED_FPS = 15            # used to size the frame buffer; browsers vary, this is a rough estimate
-
-# STUN server so the WebRTC connection can be established once deployed
-# remotely (works without this on localhost, but usually fails behind
-# NAT/firewalls once actually deployed to the cloud). Google's public STUN
-# server is free and commonly used for exactly this. If you still have
-# connectivity problems after deploying, the next step up is adding a TURN
-# server (e.g. the free tier at Open Relay Project / metered.ca) to
-# RTC_CONFIGURATION's iceServers list.
-
-
-
-RTC_CONFIGURATION = RTCConfiguration(
-    {
-        "iceServers": [
-            {"urls": ["stun:stun.l.google.com:19302"]},
-            {
-                "urls": [
-                    "turn:free.expressturn.com:3478",
-                    "turn:free.expressturn.com:3478?transport=tcp",
-                ],
-                "username": st.secrets["TURN_USERNAME"],
-                "credential": st.secrets["TURN_CREDENTIAL"],
-            },
-        ]
-    }
-)
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +304,7 @@ with col1:
         webrtc_ctx = webrtc_streamer(
             key="live-sign-recognition",
             video_frame_callback=make_video_frame_callback(live_state),
-            rtc_configuration=RTC_CONFIGURATION,
+            rtc_configuration=RTCConfiguration({"iceServers": get_ice_servers()}),
             media_stream_constraints={"video": True, "audio": False},
             async_processing=True,
         )
