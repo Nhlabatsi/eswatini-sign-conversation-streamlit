@@ -90,9 +90,8 @@ RTC_CONFIGURATION = RTCConfiguration(
             {"urls": ["stun:stun.l.google.com:19302"]},
             {
                 "urls": [
-                    "turn:global.relay.metered.ca:80",
-                    "turn:global.relay.metered.ca:443",
-                    "turn:global.relay.metered.ca:443?transport=tcp",
+                    "turn:relay1.expressturn.com:3478",
+                    "turn:relay1.expressturn.com:3478?transport=tcp",
                 ],
                 "username": st.secrets["TURN_USERNAME"],
                 "credential": st.secrets["TURN_CREDENTIAL"],
