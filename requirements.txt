@@ -2,8 +2,7 @@ streamlit>=1.38.0
 streamlit-webrtc
 av
 torch
-numpy==1.26.4
+numpy
 opencv-python-headless
-mediapipe==0.10.21
-protobuf==4.25.8
+mediapipe
 openai-whisper
