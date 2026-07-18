@@ -79,11 +79,11 @@ ASSUMED_FPS = 15            # used to size the frame buffer; browsers vary, this
 # connectivity problems after deploying, the next step up is adding a TURN
 # server (e.g. the free tier at Open Relay Project / metered.ca) to
 # RTC_CONFIGURATION's iceServers list.
-"""
+
 RTC_CONFIGURATION = RTCConfiguration(
     {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 )
-"""
+
 RTC_CONFIGURATION = RTCConfiguration(
     {
         "iceServers": [
