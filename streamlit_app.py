@@ -27,6 +27,9 @@ DESIGN NOTES (why this differs slightly from the Gradio version):
     Community Cloud enforces a hard 1 GiB RAM limit per app -- "tiny"
     has a much smaller memory footprint, trading a little transcription
     accuracy for headroom against that ceiling.
+    RTC_CONFIGURATION = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
 """
 
 import json
@@ -80,9 +83,7 @@ ASSUMED_FPS = 15            # used to size the frame buffer; browsers vary, this
 # server (e.g. the free tier at Open Relay Project / metered.ca) to
 # RTC_CONFIGURATION's iceServers list.
 
-RTC_CONFIGURATION = RTCConfiguration(
-    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-)
+
 
 RTC_CONFIGURATION = RTCConfiguration(
     {
