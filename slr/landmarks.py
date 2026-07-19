@@ -1,4 +1,4 @@
-%%writefile /content/slr_pipeline/slr/landmarks.py
+
 """
 landmarks.py
 ============
