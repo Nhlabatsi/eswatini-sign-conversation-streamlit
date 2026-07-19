@@ -309,11 +309,14 @@ with col1:
             async_processing=True,
         )
 
-        # Poll the shared state (written by the video callback thread) and
-        # sync any new confident prediction into the transcript. This loop
-        # only runs while the stream is actually playing.
         live_status_placeholder = st.empty()
-        if webrtc_ctx.state.playing:
+
+        @st.fragment(run_every=1.0)
+        def _poll_live_sign():
+            if not webrtc_ctx.state.playing:
+                live_status_placeholder.info("Camera not connected yet.")
+                return
+
             with live_state.lock:
                 current_text = live_state.last_prediction_text
                 current_word = current_text.split(" (")[0] if current_text else None
@@ -328,6 +331,8 @@ with col1:
                 st.rerun()
             else:
                 live_status_placeholder.info("Watching for signs...")
+
+        _poll_live_sign()
 
     with upload_tab:
         st.caption("Prefer to record separately and upload the clip instead.")
