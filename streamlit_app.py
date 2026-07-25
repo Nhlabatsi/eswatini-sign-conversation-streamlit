@@ -4,11 +4,27 @@ streamlit_app.py
 
 Streamlit version of the two-way conversation aid:
 
-    Deaf person   -> upload a sign clip -> Sign Recognition Model -> text
-    Hearing person -> speak into mic (or upload audio) -> Whisper -> text
-
-Both directions write into one shared transcript.
-
+    Camera / Microphone
+           |
+    +------+------+
+    |             |
+Sign Recognition  Speech Recognition
+    (SLR)              (STT)
+    |             |
+    +------+------+
+           |
+    Conversation Manager      <-- Stage 1 of the improved architecture
+           |
+    +------+------+------+
+    |      |             |
+Phrase   Context &    Intent &
+Builder   Memory       Topics
+    |      |             |
+    +------+------+------+
+           |
+    Shared Conversation Transcript
+           |
+    Text Display (Text-to-Speech: not yet implemented -- later stage)
 
 DESIGN NOTES (why this differs slightly from the Gradio version):
 
@@ -16,24 +32,27 @@ DESIGN NOTES (why this differs slightly from the Gradio version):
     single still PHOTO, not a video clip -- it cannot support our
     sequence-based sign model, which needs a run of frames over time.
     So the sign side uses file upload (record a clip on your phone/
-    webcam software separately, then upload it here) rather than a
-    live in-browser recorder. This avoids an entire category of
-    browser-recording fragility for a comparatively rare capability.
+    webcam software separately, then upload it here) as well as live
+    webcam via streamlit-webrtc.
 
-  - st.audio_input IS a genuine, built-in live microphone recorder
-    (not just a photo-style limitation), so speech recognition supports
-    live recording directly, same as before.
+  - st.audio_input IS a genuine, built-in live microphone recorder,
+    so speech recognition supports live recording directly.
 
   - Whisper defaults to "tiny" here (not "base") because Streamlit
-    Community Cloud enforces a hard 1 GiB RAM limit per app -- "tiny"
-    has a much smaller memory footprint, trading a little transcription
-    accuracy for headroom against that ceiling.
+    Community Cloud enforces a hard 1 GiB RAM limit per app.
 
   - WebRTC ICE servers come from turn.py's get_ice_servers(), which uses
-    Twilio's TURN service. This is required, not optional -- Streamlit
-    Community Cloud's infrastructure does not reliably allow WebRTC
-    connections using STUN alone (confirmed directly in streamlit-webrtc's
-    own official sample code/docs).
+    Twilio's TURN service -- required, not optional, on Streamlit
+    Community Cloud (confirmed in streamlit-webrtc's own docs).
+
+  - CONVERSATION MANAGER (see conversation/ package): individually
+    recognized sign words are no longer dumped straight into the
+    transcript one at a time. They're buffered into phrases (a pause
+    or a turn-change finalizes the phrase), tagged with a lightweight
+    rule-based intent/topic, and tracked in a short-term context
+    history -- see conversation/manager.py's docstring for exactly
+    what's implemented at this stage vs. deferred to later stages
+    (Grammar & Sentence Builder, Text-to-Speech).
 """
 
 import json
@@ -52,6 +71,7 @@ from slr.landmarks import HolisticLandmarkExtractor, iter_video_landmarks, FEATU
 from slr.model import SignLanguageArcFaceTCN
 from stt.speech_to_text import SpeechToText
 from turn import get_ice_servers
+from conversation import ConversationManager, SIGN_SPEAKER, SPEECH_SPEAKER
 
 try:
     from streamlit_webrtc import webrtc_streamer, RTCConfiguration
@@ -79,6 +99,12 @@ WINDOW_SECONDS = 2.0        # how many seconds of recent frames to keep in the b
 INFER_EVERY_N_FRAMES = 5    # run inference every N incoming frames (lower = more responsive, more CPU)
 MOTION_THRESHOLD = 0.003    # skip inference when the window is nearly static (idle hands)
 ASSUMED_FPS = 15            # used to size the frame buffer; browsers vary, this is a rough estimate
+
+# Conversation Manager tuning
+PHRASE_PAUSE_SECONDS = 3.0  # gap since the last sign word before auto-finalizing a phrase
+PHRASE_MAX_WORDS = 8        # safety cap so a phrase can't grow forever
+
+_AVATAR_BY_SPEAKER = {SIGN_SPEAKER: "\U0001F9CF", SPEECH_SPEAKER: "\U0001F5E3\uFE0F"}
 
 
 # ---------------------------------------------------------------------------
@@ -140,8 +166,8 @@ def _prepare_sequence(seq: np.ndarray, max_len: int):
     return seq_t, len_t
 
 
-def recognize_sign(video_bytes: bytes, suffix: str) -> tuple[str, list]:
-    """Returns (predicted_word_or_message, top5_list_of_(word, score))."""
+def recognize_sign(video_bytes: bytes, suffix: str) -> tuple[str, list, float]:
+    """Returns (predicted_word_or_message, top5_list_of_(word, score), confidence)."""
     model, max_len, label_map, idx_to_label, prototypes = load_sign_model()
 
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -154,7 +180,7 @@ def recognize_sign(video_bytes: bytes, suffix: str) -> tuple[str, list]:
         Path(tmp_path).unlink(missing_ok=True)
 
     if not frames:
-        return "(no landmarks detected -- try again with hands/face visible)", []
+        return "(no landmarks detected -- try again with hands/face visible)", [], 0.0
 
     seq = np.stack(frames, axis=0)
     seq_t, len_t = _prepare_sequence(seq, max_len)
@@ -169,8 +195,8 @@ def recognize_sign(video_bytes: bytes, suffix: str) -> tuple[str, list]:
             for v, i in zip(top5_vals, top5_idxs)]
 
     if best_sim.item() < SIMILARITY_THRESHOLD:
-        return "(sign not recognized confidently -- try again)", top5
-    return idx_to_label.get(best_idx.item(), "?"), top5
+        return "(sign not recognized confidently -- try again)", top5, best_sim.item()
+    return idx_to_label.get(best_idx.item(), "?"), top5, best_sim.item()
 
 
 def recognize_speech(audio_bytes: bytes, suffix: str) -> str:
@@ -197,16 +223,18 @@ class LiveSignState:
     own forked thread) and the main Streamlit script thread. streamlit-webrtc
     callbacks cannot call st.* methods directly, so the callback only writes
     into this container under a lock, and the main script thread reads from
-    it in a polling loop to update the UI.
+    it in a polling loop to feed the Conversation Manager (which lives in
+    st.session_state and is only ever touched from the main script thread).
     """
 
     def __init__(self):
         self.lock = threading.Lock()
         self.buffer = deque(maxlen=int(WINDOW_SECONDS * ASSUMED_FPS))
         self.frame_count = 0
-        self.last_prediction_text = ""
+        self.last_prediction_word = None
+        self.last_prediction_confidence = 0.0
         self.last_prediction_time = 0.0
-        self.last_appended_word = None  # avoids spamming the transcript with repeats
+        self.last_consumed_word = None  # avoids feeding the same held sign repeatedly
 
     def motion_score(self) -> float:
         if len(self.buffer) < 2:
@@ -254,18 +282,21 @@ def make_video_frame_callback(state: LiveSignState):
             if best_sim.item() >= SIMILARITY_THRESHOLD:
                 word = idx_to_label.get(best_idx.item(), "?")
                 with state.lock:
-                    state.last_prediction_text = f"{word} ({best_sim.item():.2f})"
+                    state.last_prediction_word = word
+                    state.last_prediction_confidence = best_sim.item()
                     state.last_prediction_time = time.time()
 
-        # Overlay the current prediction directly on the video feed, same
-        # as the local live_inference.py script -- gives immediate visual
-        # feedback without needing to look elsewhere on the page.
+        # Overlay the current prediction directly on the video feed --
+        # this always reflects live recognition, independent of whether
+        # it's been fed into the Conversation Manager's phrase buffer yet.
         with state.lock:
-            display_text = state.last_prediction_text if (
+            show_word = state.last_prediction_word if (
                 time.time() - state.last_prediction_time
-            ) < 2.5 else ""
-        if display_text:
+            ) < 2.5 else None
+            show_conf = state.last_prediction_confidence
+        if show_word:
             import cv2
+            display_text = f"{show_word} ({show_conf:.2f})"
             cv2.rectangle(annotated, (0, 0), (annotated.shape[1], 50), (0, 0, 0), -1)
             cv2.putText(annotated, display_text, (10, 35),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
@@ -281,13 +312,15 @@ def make_video_frame_callback(state: LiveSignState):
 st.set_page_config(page_title="Sign <-> Speech Conversation Aid", layout="wide")
 st.title("Eswatini Sign Language \u2194 Speech Conversation Aid")
 st.write(
-    "A Deaf person uploads a signed clip and it appears as text below. "
-    "A hearing person speaks into the microphone (or uploads audio) and it "
-    "appears as text too. Both people read the same shared transcript."
+    "A Deaf person signs (live on camera or an uploaded clip) and it appears as "
+    "text below. A hearing person speaks into the microphone (or uploads audio) "
+    "and it appears as text too. Both people read the same shared transcript."
 )
 
-if "history" not in st.session_state:
-    st.session_state.history = []  # list of (speaker, avatar, text) tuples
+if "conversation_manager" not in st.session_state:
+    st.session_state.conversation_manager = ConversationManager(
+        phrase_pause_seconds=PHRASE_PAUSE_SECONDS, phrase_max_words=PHRASE_MAX_WORDS
+    )
 
 col1, col2 = st.columns(2)
 
@@ -297,8 +330,9 @@ with col1:
 
     with live_tab:
         st.caption(
-            "Sign in view of your camera. The recognized word appears overlaid on "
-            "the video and gets added to the transcript below automatically."
+            "Sign in view of your camera. Words are buffered into a phrase as you "
+            "sign; pause for a few seconds (or switch to speech) to commit the "
+            "phrase to the shared transcript below."
         )
         live_state = get_live_state()
         webrtc_ctx = webrtc_streamer(
@@ -313,37 +347,56 @@ with col1:
 
         @st.fragment(run_every=1.0)
         def _poll_live_sign():
+            manager = st.session_state.conversation_manager
+
             if not webrtc_ctx.state.playing:
                 live_status_placeholder.info("Camera not connected yet.")
                 return
 
             with live_state.lock:
-                current_text = live_state.last_prediction_text
-                current_word = current_text.split(" (")[0] if current_text else None
-                is_recent = (time.time() - live_state.last_prediction_time) < 2.5
+                word = live_state.last_prediction_word
+                confidence = live_state.last_prediction_confidence
+                pred_time = live_state.last_prediction_time
+                is_recent = (time.time() - pred_time) < 2.5
 
-            if current_word and is_recent and current_word != live_state.last_appended_word:
-                st.session_state.history.append(
-                    ("Deaf person (signed)", "\U0001F9CF", current_word)
-                )
-                live_state.last_appended_word = current_word
-                live_status_placeholder.success(f"Recognized: {current_text}")
+            # Feed a genuinely new, confident, recent word into the phrase
+            # buffer (not on every poll tick -- only once per distinct sign).
+            if word and is_recent and word != live_state.last_consumed_word:
+                manager.add_sign_word(word, confidence=confidence, timestamp=pred_time)
+                live_state.last_consumed_word = word
+
+            # Check whether the buffered phrase should be committed (pause
+            # elapsed, or it hit the max-words safety cap).
+            finalized = manager.maybe_finalize_sign_phrase()
+
+            pending = manager.pending_sign_phrase_preview()
+            if finalized:
+                live_status_placeholder.success(f"Added to transcript: \u201c{finalized['text']}\u201d")
                 st.rerun()
+            elif pending:
+                live_status_placeholder.info(f"Signing: {pending} \u2026")
             else:
                 live_status_placeholder.info("Watching for signs...")
 
         _poll_live_sign()
 
     with upload_tab:
-        st.caption("Prefer to record separately and upload the clip instead.")
+        st.caption(
+            "Prefer to record separately and upload the clip instead. Each upload "
+            "is treated as one complete phrase and added to the transcript immediately."
+        )
         sign_file = st.file_uploader(
             "Upload a short clip of one sign", type=["mp4", "mov", "webm", "avi"]
         )
         if st.button("Recognize sign", type="primary") and sign_file is not None:
             with st.spinner("Extracting landmarks and matching..."):
                 suffix = Path(sign_file.name).suffix or ".mp4"
-                word, top5 = recognize_sign(sign_file.getvalue(), suffix)
-            st.session_state.history.append(("Deaf person (signed)", "\U0001F9CF", word))
+                word, top5, confidence = recognize_sign(sign_file.getvalue(), suffix)
+
+            manager = st.session_state.conversation_manager
+            manager.add_sign_word(word, confidence=confidence)
+            finalized = manager.force_finalize_sign_phrase()
+
             st.success(f"Recognized: {word}")
             if top5:
                 st.caption("Top 5 matches: " + ", ".join(f"{w} ({s:.2f})" for w, s in top5))
@@ -360,17 +413,29 @@ with col2:
             with st.spinner("Transcribing..."):
                 suffix = Path(getattr(source, "name", "audio.wav")).suffix or ".wav"
                 text = recognize_speech(source.getvalue(), suffix)
-            st.session_state.history.append(("Hearing person (spoke)", "\U0001F5E3\uFE0F", text))
+
+            # add_speech_text() also force-finalizes any pending sign phrase
+            # first, so turns stay in chronological order (see manager.py).
+            st.session_state.conversation_manager.add_speech_text(text)
             st.success(f"Transcribed: {text}")
 
 st.divider()
 st.subheader("Shared conversation transcript")
-if not st.session_state.history:
+transcript = st.session_state.conversation_manager.get_transcript()
+if not transcript:
     st.caption("Nothing yet -- try recognizing a sign or transcribing some speech above.")
-for speaker, avatar, text in st.session_state.history:
-    with st.chat_message(speaker, avatar=avatar):
-        st.write(text)
+for turn in transcript:
+    avatar = _AVATAR_BY_SPEAKER.get(turn["speaker"], "\U0001F4AC")
+    with st.chat_message(turn["speaker"], avatar=avatar):
+        st.write(turn["sentence"])
+        details = []
+        if turn["modality"] == "sign" and turn["sentence"] != turn["text"]:
+            details.append(f"raw signs: {turn['text']}")
+        if turn.get("intent"):
+            details.append(f"intent: {turn['intent']}")
+        if details:
+            st.caption(" \u00b7 ".join(details))
 
 if st.button("Clear conversation"):
-    st.session_state.history = []
+    st.session_state.conversation_manager.reset()
     st.rerun()
