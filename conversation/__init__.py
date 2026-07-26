@@ -1,11 +1,15 @@
 """
-grammar: the Grammar & Sentence Builder stage (Stage 2).
+conversation: the Conversation Manager stage of the pipeline.
 
-Takes raw recognized sign glosses (in signed order) plus a tagged
-intent, and produces a best-effort natural-English rendering. See
-builder.py's module docstring for exactly what patterns are handled
-and, importantly, what's explicitly NOT handled yet.
+    Sign Recognition (SLR) --\\
+                               >--> Conversation Manager --> transcript
+    Speech Recognition (STT)-/
+
+See manager.py for the orchestrator and its docstring for what's
+implemented at this stage (phrase buffering, turn history, lightweight
+intent/topic tagging, and Stage 2's grammar-built sentences) vs.
+deliberately deferred (Text-to-Speech).
 """
-from .builder import build_sentence
+from .manager import ConversationManager, SIGN_SPEAKER, SPEECH_SPEAKER
 
-__all__ = ["build_sentence"]
+__all__ = ["ConversationManager", "SIGN_SPEAKER", "SPEECH_SPEAKER"]
