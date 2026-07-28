@@ -215,9 +215,26 @@ def iter_video_landmarks(video_path: str, extractor: HolisticLandmarkExtractor =
 
 
 def iter_camera_landmarks(camera_index: int = 0, extractor: HolisticLandmarkExtractor = None,
-                           draw: bool = False):
+                           draw: bool = False, mirror_display: bool = True):
     """
-    Generator that yields (feature_vec, frame) pairs read live from a camera.
+    Generator that yields (feature_vec, display_frame) pairs read live
+    from a camera.
+
+    IMPORTANT: `feature_vec` is computed from the RAW, un-mirrored
+    camera frame -- the same way `iter_video_landmarks` processes
+    training videos (which are never flipped). MediaPipe assigns
+    "left_hand"/"right_hand" based on the image, not anatomy, so if
+    this function flipped the frame before extraction (as it used to),
+    every live-camera feature vector would have its left/right hand
+    blocks swapped relative to every training example. That mismatch
+    alone can tank real-time accuracy even though the model tests fine
+    on training videos, which are never flipped.
+
+    `mirror_display` only affects the frame handed back for on-screen
+    preview -- flipping happens *after* landmark extraction, purely so
+    the user sees a natural mirror-image of themselves. It has zero
+    effect on `feature_vec`. Set it False if you don't need a preview
+    window at all (e.g. running headless).
     """
     owns_extractor = extractor is None
     if owns_extractor:
@@ -229,9 +246,11 @@ def iter_camera_landmarks(camera_index: int = 0, extractor: HolisticLandmarkExtr
             ok, frame = cap.read()
             if not ok:
                 break
-            frame = cv2.flip(frame, 1)
+            # Extraction happens on the RAW frame -- matches training-data
+            # processing exactly. Do not flip before this line.
             vec, annotated = extractor.process(frame, draw=draw)
-            yield vec, annotated
+            display_frame = cv2.flip(annotated, 1) if mirror_display else annotated
+            yield vec, display_frame
     finally:
         cap.release()
         if owns_extractor:
