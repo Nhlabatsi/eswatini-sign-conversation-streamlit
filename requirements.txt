@@ -2,6 +2,7 @@ streamlit>=1.38.0
 streamlit-webrtc
 av
 torch
+transformers>=4.42
 
 opencv-python-headless
 
