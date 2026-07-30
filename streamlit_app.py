@@ -347,6 +347,17 @@ with col1:
 
         @st.fragment(run_every=1.0)
         def _poll_live_sign():
+            # Fragments with run_every keep firing on their own timer even
+            # if the server process restarted underneath them (e.g. a
+            # redeploy) and wiped session_state. When that happens this
+            # fragment can run before the top-of-script initialization gets
+            # a chance to recreate conversation_manager, so check instead
+            # of assuming it's always there -- and force a full-app rerun
+            # (not just a fragment rerun) so the rest of the script's
+            # session_state setup runs again too.
+            if "conversation_manager" not in st.session_state:
+                st.rerun(scope="app")
+                return
             manager = st.session_state.conversation_manager
 
             if not webrtc_ctx.state.playing:
