@@ -95,35 +95,10 @@ SIMILARITY_THRESHOLD = 0.3
 DEVICE = torch.device("cpu")  # small model -- CPU is fine, avoids any GPU/quota concerns
 
 # Live sign recognition tuning
-#
-# The old fixed WINDOW_SECONDS + INFER_EVERY_N_FRAMES design ran inference
-# on an arbitrary rolling window every N frames, regardless of whether a
-# sign was actually in progress. That's a real mismatch with training:
-# best_model.pt was trained on complete, trimmed single-sign clips, so
-# feeding it "tail of previous sign + idle + start of next sign" (which a
-# fixed window does constantly) gives it inputs it never saw, and explains
-# a lot of the live-vs-upload accuracy gap. Replaced with a small
-# state machine that detects the actual start/end of a sign via motion,
-# and classifies once per completed sign -- exactly how infer_webcam.py
-# (the local/offline version of this same idea) already works.
-MOTION_START_THRESHOLD = 0.006   # motion needed to declare "a sign has begun"
-MOTION_STOP_THRESHOLD = 0.003    # motion below this counts toward "sign has ended"
-STOP_GRACE_SECONDS = 0.4         # how long motion must stay below the stop threshold
-                                  # before the sign is considered finished -- absorbs
-                                  # brief natural pauses mid-sign without cutting it off
-PRE_ROLL_SECONDS = 0.15          # frames kept from just BEFORE motion crossed the start
-                                  # threshold, so the very beginning of a sign (which is
-                                  # often slow/low-motion) isn't clipped off
-MIN_SIGN_SECONDS = 0.25          # shorter than this is almost certainly noise/jitter,
-                                  # not a real sign -- discarded rather than classified
-MAX_SIGN_SECONDS = 4.0           # safety cap in case motion never drops (e.g. continuous
-                                  # movement) -- forces a classification rather than
-                                  # buffering forever
-ASSUMED_FPS = 15                 # only used as a fallback before enough real frame
-                                  # timestamps have arrived to estimate actual FPS --
-                                  # see LiveSignState._update_fps_estimate below. Browser
-                                  # webcam frame rates vary a lot, so measuring beats
-                                  # assuming once the stream is actually running.
+WINDOW_SECONDS = 2.0        # how many seconds of recent frames to keep in the buffer
+INFER_EVERY_N_FRAMES = 5    # run inference every N incoming frames (lower = more responsive, more CPU)
+MOTION_THRESHOLD = 0.003    # skip inference when the window is nearly static (idle hands)
+ASSUMED_FPS = 15            # used to size the frame buffer; browsers vary, this is a rough estimate
 
 # Conversation Manager tuning
 PHRASE_PAUSE_SECONDS = 3.0  # gap since the last sign word before auto-finalizing a phrase
@@ -219,8 +194,7 @@ def recognize_sign(video_bytes: bytes, suffix: str) -> tuple[str, list, float]:
     top5 = [(idx_to_label.get(i.item(), "?"), round(v.item(), 4))
             for v, i in zip(top5_vals, top5_idxs)]
 
-    threshold = st.session_state.get("similarity_threshold", SIMILARITY_THRESHOLD)
-    if best_sim.item() < threshold:
+    if best_sim.item() < SIMILARITY_THRESHOLD:
         return "(sign not recognized confidently -- try again)", top5, best_sim.item()
     return idx_to_label.get(best_idx.item(), "?"), top5, best_sim.item()
 
@@ -251,110 +225,22 @@ class LiveSignState:
     into this container under a lock, and the main script thread reads from
     it in a polling loop to feed the Conversation Manager (which lives in
     st.session_state and is only ever touched from the main script thread).
-
-    Segmentation state machine (replaces the old fixed-window approach):
-
-        IDLE --[motion >= start threshold]--> SIGNING
-        SIGNING --[motion < stop threshold for STOP_GRACE_SECONDS]--> IDLE (classify)
-        SIGNING --[buffer exceeds MAX_SIGN_SECONDS]--> IDLE (classify, forced)
-
-    A short pre-roll of recent frames is kept continuously during IDLE so
-    that when a sign is detected, the buffer used for classification
-    includes the slow/low-motion frames right at the start of the sign,
-    not just the frames from the moment motion crossed the threshold.
     """
 
     def __init__(self):
         self.lock = threading.Lock()
-
-        self.state = "IDLE"
-        self.pre_roll = deque(maxlen=1)   # resized once real FPS is known -- see _update_fps_estimate
-        self.active_buffer: list = []
-        self.prev_vec = None
-        self.low_motion_since: float | None = None
-        self.sign_start_time: float | None = None
-
-        # Running estimate of actual incoming frame rate, since browser
-        # webcam FPS varies a lot and ASSUMED_FPS is only a seed value.
-        self._last_frame_time: float | None = None
-        self.estimated_fps = float(ASSUMED_FPS)
-
+        self.buffer = deque(maxlen=int(WINDOW_SECONDS * ASSUMED_FPS))
         self.frame_count = 0
         self.last_prediction_word = None
         self.last_prediction_confidence = 0.0
         self.last_prediction_time = 0.0
         self.last_consumed_word = None  # avoids feeding the same held sign repeatedly
 
-        # Small counter so the UI can say "saw motion but couldn't recognize it"
-        # rather than looking identical to "nothing happened" -- not required,
-        # but cheap and useful feedback while a signer is calibrating distance/lighting.
-        self.last_rejected_time: float = 0.0
-
-    def _update_fps_estimate(self, now: float):
-        if self._last_frame_time is not None:
-            dt = now - self._last_frame_time
-            if 0 < dt < 1.0:  # ignore stalls/pauses so they don't skew the estimate
-                instantaneous_fps = 1.0 / dt
-                # Exponential moving average -- smooths jitter without lagging
-                # too far behind a genuine sustained change in frame rate.
-                self.estimated_fps = 0.9 * self.estimated_fps + 0.1 * instantaneous_fps
-        self._last_frame_time = now
-
-        target_pre_roll_len = max(1, int(PRE_ROLL_SECONDS * self.estimated_fps))
-        if self.pre_roll.maxlen != target_pre_roll_len:
-            self.pre_roll = deque(self.pre_roll, maxlen=target_pre_roll_len)
-
-    def process_frame(self, vec: np.ndarray, now: float):
-        """
-        Feeds one frame's landmark vector through the segmentation state
-        machine. Returns a completed clip (np.ndarray, shape (T, FEATURE_DIM))
-        if a sign just finished and should be classified, else None.
-        Must be called under self.lock.
-        """
-        self._update_fps_estimate(now)
-        self.frame_count += 1
-
-        motion = 0.0 if self.prev_vec is None else float(np.abs(vec - self.prev_vec).mean())
-        self.prev_vec = vec
-
-        if self.state == "IDLE":
-            self.pre_roll.append(vec)
-            if motion >= MOTION_START_THRESHOLD:
-                self.state = "SIGNING"
-                self.active_buffer = list(self.pre_roll) + [vec]
-                self.sign_start_time = now
-                self.low_motion_since = None
-            return None
-
-        # state == "SIGNING"
-        self.active_buffer.append(vec)
-        max_frames = int(MAX_SIGN_SECONDS * self.estimated_fps)
-        elapsed = now - (self.sign_start_time or now)
-
-        force_end = len(self.active_buffer) >= max_frames or elapsed >= MAX_SIGN_SECONDS
-        natural_end = False
-        if motion < MOTION_STOP_THRESHOLD:
-            if self.low_motion_since is None:
-                self.low_motion_since = now
-            elif (now - self.low_motion_since) >= STOP_GRACE_SECONDS:
-                natural_end = True
-        else:
-            self.low_motion_since = None  # motion resumed -- sign is still going
-
-        if force_end or natural_end:
-            clip = np.stack(self.active_buffer, axis=0)
-            self.state = "IDLE"
-            self.active_buffer = []
-            self.low_motion_since = None
-            self.sign_start_time = None
-            self.pre_roll.clear()
-
-            min_frames = max(1, int(MIN_SIGN_SECONDS * self.estimated_fps))
-            if clip.shape[0] < min_frames:
-                return None  # almost certainly noise, not a real sign -- discard silently
-            return clip
-
-        return None
+    def motion_score(self) -> float:
+        if len(self.buffer) < 2:
+            return 0.0
+        arr = np.stack(list(self.buffer), axis=0)
+        return float(np.abs(np.diff(arr, axis=0)).mean())
 
 
 @st.cache_resource
@@ -375,49 +261,45 @@ def make_video_frame_callback(state: LiveSignState):
         img = frame.to_ndarray(format="bgr24")
 
         vec, annotated = extractor.process(img, draw=True)
-        now = time.time()
 
         with state.lock:
-            completed_clip = state.process_frame(vec, now)
-            current_fsm_state = state.state
+            state.buffer.append(vec)
+            state.frame_count += 1
+            do_infer = (
+                state.frame_count % INFER_EVERY_N_FRAMES == 0
+                and len(state.buffer) >= max(5, state.buffer.maxlen // 3)
+            )
+            motion = state.motion_score() if do_infer else 0.0
 
-        if completed_clip is not None:
-            # A full sign (start-to-end, via the motion state machine) just
-            # finished -- classify it exactly the way training data looked:
-            # one complete, variable-length clip, not a fixed-size window.
-            threshold = st.session_state.get("similarity_threshold", SIMILARITY_THRESHOLD)
-            seq_t, len_t = _prepare_sequence(completed_clip, max_len)
+        if do_infer and motion >= MOTION_THRESHOLD:
+            with state.lock:
+                seq = np.stack(list(state.buffer), axis=0)
+            seq_t, len_t = _prepare_sequence(seq, max_len)
             with torch.no_grad():
                 emb = model.embed(seq_t, len_t)
                 sims = (emb @ prototypes.t()).squeeze(0)
                 best_sim, best_idx = sims.max(dim=0)
-            if best_sim.item() >= threshold:
+            if best_sim.item() >= SIMILARITY_THRESHOLD:
                 word = idx_to_label.get(best_idx.item(), "?")
                 with state.lock:
                     state.last_prediction_word = word
                     state.last_prediction_confidence = best_sim.item()
-                    state.last_prediction_time = now
-            else:
-                # Motion looked like a sign, but nothing matched confidently --
-                # surfaced in the UI as distinct from "no motion detected yet"
-                # (see _poll_live_sign), rather than silently doing nothing.
-                with state.lock:
-                    state.last_rejected_time = now
+                    state.last_prediction_time = time.time()
 
-        # Overlay the current prediction and FSM state directly on the video
-        # feed -- always reflects live recognition, independent of whether
+        # Overlay the current prediction directly on the video feed --
+        # this always reflects live recognition, independent of whether
         # it's been fed into the Conversation Manager's phrase buffer yet.
         with state.lock:
             show_word = state.last_prediction_word if (
                 time.time() - state.last_prediction_time
             ) < 2.5 else None
             show_conf = state.last_prediction_confidence
-        display_text = f"{show_word} ({show_conf:.2f})" if show_word else f"[{current_fsm_state}]"
-        text_color = (0, 255, 0) if show_word else (0, 200, 200)
-        import cv2
-        cv2.rectangle(annotated, (0, 0), (annotated.shape[1], 50), (0, 0, 0), -1)
-        cv2.putText(annotated, display_text, (10, 35),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, text_color, 2, cv2.LINE_AA)
+        if show_word:
+            import cv2
+            display_text = f"{show_word} ({show_conf:.2f})"
+            cv2.rectangle(annotated, (0, 0), (annotated.shape[1], 50), (0, 0, 0), -1)
+            cv2.putText(annotated, display_text, (10, 35),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
 
         return av.VideoFrame.from_ndarray(annotated, format="bgr24")
 
@@ -438,28 +320,6 @@ st.write(
 if "conversation_manager" not in st.session_state:
     st.session_state.conversation_manager = ConversationManager(
         phrase_pause_seconds=PHRASE_PAUSE_SECONDS, phrase_max_words=PHRASE_MAX_WORDS
-    )
-if "similarity_threshold" not in st.session_state:
-    st.session_state.similarity_threshold = SIMILARITY_THRESHOLD
-
-with st.sidebar:
-    st.subheader("Recognition tuning")
-    st.session_state.similarity_threshold = st.slider(
-        "Similarity threshold",
-        min_value=0.0, max_value=1.0,
-        value=st.session_state.similarity_threshold, step=0.05,
-        help="Minimum cosine similarity to accept a prediction. There's no "
-             "single correct value baked into the code -- the right number "
-             "depends on your model's actual embedding distribution. Start "
-             "around what evaluate_holdout.py's score spread suggests, then "
-             "raise it here if you're seeing confident-looking wrong guesses, "
-             "or lower it if correct signs are getting rejected as "
-             "\"not recognized\".",
-    )
-    st.caption(
-        f"Live segmentation: motion \u2265 {MOTION_START_THRESHOLD} starts a sign, "
-        f"motion < {MOTION_STOP_THRESHOLD} for {STOP_GRACE_SECONDS}s ends it "
-        f"(min {MIN_SIGN_SECONDS}s, max {MAX_SIGN_SECONDS}s per sign)."
     )
 
 col1, col2 = st.columns(2)
@@ -497,10 +357,7 @@ with col1:
                 word = live_state.last_prediction_word
                 confidence = live_state.last_prediction_confidence
                 pred_time = live_state.last_prediction_time
-                rejected_time = live_state.last_rejected_time
-                fsm_state = live_state.state
                 is_recent = (time.time() - pred_time) < 2.5
-                was_just_rejected = (time.time() - rejected_time) < 2.5 and not is_recent
 
             # Feed a genuinely new, confident, recent word into the phrase
             # buffer (not on every poll tick -- only once per distinct sign).
@@ -518,13 +375,6 @@ with col1:
                 st.rerun()
             elif pending:
                 live_status_placeholder.info(f"Signing: {pending} \u2026")
-            elif was_just_rejected:
-                live_status_placeholder.warning(
-                    "Saw a sign-like motion but couldn't match it confidently "
-                    "-- try again, or lower the similarity threshold in the sidebar."
-                )
-            elif fsm_state == "SIGNING":
-                live_status_placeholder.info("Detecting a sign in progress\u2026")
             else:
                 live_status_placeholder.info("Watching for signs...")
 
