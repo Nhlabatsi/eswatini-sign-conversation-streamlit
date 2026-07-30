@@ -14,12 +14,25 @@ Stage 1 of the improved architecture:
                                           |-- Context & Memory (turn history)
                                           |-- Intent & Topics (lightweight tagging)
 
-Stage 2 (see conversation/grammar/): finalized sign phrases are now
-also run through a rule-based Grammar & Sentence Builder, producing a
-"sentence" field alongside the raw "text" (recognized glosses) --
-e.g. text="YOU NAME WHAT", sentence="What is your name?". Speech
-turns already contain natural language (Whisper output), so their
-"sentence" field is just the same text unchanged.
+Stage 2 (see conversation/grammar/ and conversation/gloss_to_text.py):
+finalized sign phrases are now run through a Grammar & Sentence Builder,
+producing a "sentence" field alongside the raw "text" (recognized
+glosses) -- e.g. text="YOU NAME WHAT", sentence="What is your name?".
+Speech turns already contain natural language (Whisper output), so
+their "sentence" field is just the same text unchanged.
+
+    As of this revision, the sentence builder is LM-based: it calls
+    SmolLM2-135M-Instruct (conversation/gloss_to_text.py) to turn the
+    raw gloss into a fluent sentence, since a small general-purpose
+    instruct model handles the "clean up this rough note into natural
+    English" task well without needing ESL-specific training data --
+    the sign side still does all the actual visual-language learning.
+    The original rule-based build_sentence() (conversation/grammar/)
+    is kept as an automatic fallback: if the LM fails to load or
+    errors at inference time (e.g. no network to fetch the model
+    weights, out-of-memory on a constrained host), we fall back to the
+    rule-based sentence rather than losing the "sentence" field or
+    crashing the conversation aid.
 
 NOT yet implemented (later stage, by design):
     - Text-to-Speech output
@@ -45,15 +58,19 @@ single thread.
 
 from __future__ import annotations
 
+import logging
 import time
 
 from .phrase_builder import PhraseBuilder
 from .context import ConversationContext
 from . import intent as intent_module
 from .grammar import build_sentence
+from .gloss_to_text import GlossToTextConverter
 
 SIGN_SPEAKER = "Deaf person"
 SPEECH_SPEAKER = "Hearing person"
+
+logger = logging.getLogger(__name__)
 
 
 class ConversationManager:
@@ -103,12 +120,31 @@ class ConversationManager:
         if phrase is None:
             return None
         tagged_intent, topics = intent_module.classify(phrase["text"])
-        sentence = build_sentence(phrase["words"], tagged_intent)
+        sentence = self._build_sentence(phrase["text"], phrase["words"], tagged_intent)
         return self.context.add_turn(
             speaker=SIGN_SPEAKER, modality="sign", text=phrase["text"],
             sentence=sentence, intent=tagged_intent, topics=topics,
             timestamp=phrase["end_time"],
         )
+
+    def _build_sentence(self, gloss_text: str, words, tagged_intent) -> str:
+        """Turn a finalized gloss ('YOU NAME WHAT') into a natural
+        English sentence ('What is your name?').
+
+        Tries the LM-based converter (SmolLM2-135M-Instruct) first.
+        Falls back to the original rule-based build_sentence() if the
+        LM raises for any reason -- model not downloaded yet, no
+        network, OOM, etc. A degraded rule-based sentence is far
+        better than crashing a live two-way conversation aid.
+        """
+        try:
+            return GlossToTextConverter.get().convert(gloss_text)
+        except Exception:
+            logger.exception(
+                "GlossToTextConverter failed on gloss %r -- falling back "
+                "to rule-based build_sentence()", gloss_text
+            )
+            return build_sentence(words, tagged_intent)
 
     # -- Speech side: Whisper already gives full utterances ---------------
 
